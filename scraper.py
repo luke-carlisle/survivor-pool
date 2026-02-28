@@ -1,9 +1,23 @@
 """
-Fundas Friends Survivor 50 — Scraper v3
-Uses the official Fandom MediaWiki API — the right way to read fan wiki data.
-No scraping, no bot detection, no 403s.
+Fundas Friends Survivor 50 — Scraper v4
+Parses the Fandom wiki Castaways table using the official MediaWiki API.
+Based on confirmed wikitext structure from Survivor 49.
 
-API docs: https://survivor.fandom.com/api.php
+Castaway table row format:
+  | [[File:image]]
+  | '''[[Name]]''' <small>age, location / occupation</small>
+  | tribe info columns...
+  | {{nowrap|FINISH TEXT}}
+  | votes against
+
+Finish text patterns:
+  "Nth Voted Out\nDay X"
+  "Nth Voted Out\nNth Jury Member\nDay X"
+  "Evacuated\nDay X"
+  "Eliminated\nNth Jury Member\nDay X"   (fire-making)
+  "Runner-Up"
+  "Second Runner-Up"
+  "Sole Survivor"
 """
 
 import json
@@ -15,9 +29,9 @@ import os
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "survivor_data.json")
 
-# ── NAME NORMALIZATION ────────────────────────────────────────────────────────
-# Maps any name variant the wiki might use → our internal cast key
+FANDOM_API = "https://survivor.fandom.com/api.php"
 
+# Map wiki name → our internal cast key
 NAME_MAP = {
     "Aubry Bracco":"Aubrey","Aubry":"Aubrey","Aubrey":"Aubrey",
     "Genevieve Mushaluk":"Genevieve","Genevieve":"Genevieve",
@@ -52,8 +66,6 @@ def normalize(name):
     first = name.split()[0] if name else ""
     return NAME_MAP.get(first)
 
-# ── FILE I/O ──────────────────────────────────────────────────────────────────
-
 def load_existing():
     try:
         with open(DATA_FILE) as f:
@@ -68,15 +80,8 @@ def save(data):
           f"eliminated={data['eliminated']}, "
           f"status={data['scrape_status']}")
 
-# ── FANDOM OFFICIAL API ───────────────────────────────────────────────────────
-# Uses api.php (MediaWiki API) — not HTML scraping.
-# Fandom explicitly supports this for fan/developer use.
-# Docs: https://www.mediawiki.org/wiki/API:Main_page
-
-FANDOM_API = "https://survivor.fandom.com/api.php"
-
-def fandom_api_fetch(page_title):
-    """Fetch wikitext for a page via the official Fandom MediaWiki API."""
+def fandom_fetch(page_title):
+    """Fetch wikitext via the official Fandom MediaWiki API."""
     params = urllib.parse.urlencode({
         "action": "parse",
         "page": page_title,
@@ -85,205 +90,192 @@ def fandom_api_fetch(page_title):
         "formatversion": "2",
     })
     url = f"{FANDOM_API}?{params}"
-    print(f"    API call: {url}")
-
+    print(f"    Fetching: {url}")
     req = urllib.request.Request(url, headers={
-        # Identify ourselves — good practice with any API
         "User-Agent": "FundasFriendsSurvivorPool/1.0 (private fan pool; not commercial)",
         "Accept": "application/json",
     })
     with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        data = json.loads(resp.read().decode("utf-8"))
+    if "error" in data:
+        raise ValueError(f"API error: {data['error'].get('info','unknown')}")
+    return data["parse"]["wikitext"]
 
-def find_season_page():
-    """Try several likely page titles until we find one that exists."""
-    candidates = [
-        "Survivor 50: In the Hands of the Fans",
-        "Survivor_50:_In_the_Hands_of_the_Fans",
-        "Survivor 50",
-        "Survivor: In the Hands of the Fans",
-    ]
-    for title in candidates:
-        try:
-            data = fandom_api_fetch(title)
-            if "error" in data:
-                print(f"    '{title}': page not found")
-                continue
-            wikitext = data.get("parse", {}).get("wikitext", "")
-            if wikitext:
-                print(f"    Found page: '{title}' ({len(wikitext)} chars)")
-                return title, wikitext
-        except Exception as e:
-            print(f"    '{title}' error: {e}")
-    return None, None
-
-# ── EPISODE PAGES ─────────────────────────────────────────────────────────────
-# Individual episode pages have the most reliable elimination data.
-# e.g. "Episode 1 (Survivor 50)"
-
-def fetch_episode_pages(season_title, max_ep=30):
-    """Fetch individual episode pages to get per-episode boot data."""
-    eliminations_by_ep = {}
-    milestones = {}
-
-    for ep_num in range(1, max_ep + 1):
-        # Try common episode page title formats
-        page_candidates = [
-            f"Episode {ep_num} (Survivor 50)",
-            f"Episode {ep_num} (Survivor: In the Hands of the Fans)",
-        ]
-        for title in page_candidates:
-            try:
-                data = fandom_api_fetch(title)
-                if "error" in data:
-                    continue
-                wikitext = data.get("parse", {}).get("wikitext", "")
-                if not wikitext:
-                    continue
-
-                print(f"    Episode {ep_num} page found ({len(wikitext)} chars)")
-                booted = parse_episode_boot(wikitext, ep_num)
-                if booted:
-                    eliminations_by_ep[ep_num] = booted
-
-                # Check for milestone markers
-                if re.search(r'[Mm]erge|[Ss]witch.*tribe|[Tt]ribe.*[Mm]erge', wikitext):
-                    if "merge" not in milestones:
-                        milestones["merge_episode"] = ep_num
-
-                break  # found a valid page, stop trying candidates
-
-            except Exception as e:
-                # Page doesn't exist = this episode hasn't aired yet, stop looking
-                if "404" in str(e) or "missing" in str(e).lower():
-                    print(f"    Episode {ep_num} not found — stopping at ep {ep_num-1}")
-                    return ep_num - 1, eliminations_by_ep, milestones
-                print(f"    Episode {ep_num} error: {e}")
-                break
-
-    return max_ep, eliminations_by_ep, milestones
-
-def parse_episode_boot(wikitext, ep_num):
-    """Extract who was voted out from an episode's wikitext."""
-    booted = []
-
-    # Pattern 1: "Voted out" followed by name in wiki link
-    for match in re.finditer(
-        r'[Vv]oted\s+[Oo]ut[^\n]{0,200}',
-        wikitext
-    ):
-        names = re.findall(r'\[\[([^\]|#]+)', match.group(0))
-        for name in names:
-            key = normalize(name)
-            if key and key not in booted:
-                booted.append(key)
-
-    # Pattern 2: Table row with elimination keyword
-    for row in re.split(r'\|-', wikitext):
-        if not re.search(r'[Vv]oted|[Ee]limin|[Qq]uit|[Mm]edevac', row):
-            continue
-        names = re.findall(r'\[\[([^\]|#]+)', row)
-        for name in names:
-            key = normalize(name)
-            if key and key not in booted:
-                booted.append(key)
-
-    return booted
-
-# ── PARSE SEASON PAGE ─────────────────────────────────────────────────────────
-
-def parse_season_page(wikitext):
+def parse_castaways_table(wikitext):
     """
-    Parse the main season page wikitext.
-    This is less precise than episode pages but gives a good overview.
+    Parse the ==Castaways== wikitable to extract elimination data.
+
+    Each castaway row contains (based on confirmed S49 structure):
+      - Name in '''[[Name]]''' format
+      - Finish in {{nowrap|FINISH TEXT}} format
+
+    Finish text patterns we care about:
+      "Nth Voted Out"              → eliminated
+      "Evacuated"                  → eliminated
+      "Eliminated"                 → eliminated (fire-making loss)
+      "Nth Jury Member"            → jury milestone
+      "Runner-Up" / "Second Runner-Up" → final3 milestone
+      "Sole Survivor"              → winner
     """
-    eliminated = set()
-    milestones = {}
-    episode_count = 0
-
-    # Episode count
-    ep_nums = re.findall(r'[Ee]pisode[s]?\s*(\d+)', wikitext)
-    if ep_nums:
-        episode_count = max((int(n) for n in ep_nums if int(n) <= 30), default=0)
-
-    # Voted out patterns in wikitext tables
-    for row in re.split(r'\|-', wikitext):
-        if not re.search(r'[Vv]oted\s+[Oo]ut|[Ee]liminated|[Qq]uit|[Mm]edevac|[Ff]ire', row):
-            continue
-        for name in re.findall(r'\[\[([^\]|#]+)', row):
-            key = normalize(name)
-            if key:
-                eliminated.add(key)
-
-    # Merge
-    merge_match = re.search(r'[Mm]erge[^\n]{0,300}', wikitext)
-    if merge_match:
-        merge_keys = [normalize(n) for n in re.findall(r'\[\[([^\]|#]+)', merge_match.group(0)) if normalize(n)]
-        if merge_keys:
-            milestones["merge"] = list(set(merge_keys))
-
-    # Jury
-    jury_match = re.search(r'[Jj]ury[^\n]{0,300}', wikitext)
-    if jury_match:
-        jury_keys = [normalize(n) for n in re.findall(r'\[\[([^\]|#]+)', jury_match.group(0)) if normalize(n)]
-        if jury_keys:
-            milestones["jury"] = list(set(jury_keys))
-
-    # Winner
-    winner_match = re.search(r'[Ss]ole\s+[Ss]urvivor[^\n]{0,100}\[\[([^\]|#]+)', wikitext)
-    if winner_match:
-        wk = normalize(winner_match.group(1))
-        if wk:
-            milestones["winner"] = wk
-
-    return episode_count, list(eliminated), milestones
-
-# ── MAIN SCRAPE ───────────────────────────────────────────────────────────────
-
-def scrape():
-    print("  Using Fandom MediaWiki API...")
-
-    # Step 1: Find the season page
-    title, wikitext = find_season_page()
-    if not wikitext:
-        print("  Could not find season page on Fandom wiki")
+    # Find the Castaways section
+    cast_start = wikitext.find("==Castaways==")
+    if cast_start == -1:
+        cast_start = wikitext.find("== Castaways ==")
+    if cast_start == -1:
+        print("    WARNING: Could not find ==Castaways== section")
         return None
 
-    # Step 2: Parse season page for overview
-    episode_count, eliminated, milestones = parse_season_page(wikitext)
-    print(f"  Season page: ep={episode_count}, eliminated={eliminated}")
+    # End at the next == section ==
+    next_section = re.search(r'\n==[^=]', wikitext[cast_start + 20:])
+    if next_section:
+        cast_section = wikitext[cast_start: cast_start + 20 + next_section.start()]
+    else:
+        cast_section = wikitext[cast_start:]
 
-    # Step 3: Validate — if numbers seem off, trust only episode count from
-    # wiki structure, not content (wiki may have pre-season info)
-    # Cross-check: eliminated players should be <= episode_count
-    if len(eliminated) > episode_count and episode_count > 0:
-        print(f"  Warning: {len(eliminated)} eliminated but only {episode_count} episodes — "
-              f"wiki may have pre-season data, keeping episode count only")
-        # Only keep eliminated if it seems reasonable (1-2 boots per episode max)
-        if len(eliminated) > episode_count * 2:
-            eliminated = []  # too many, probably wrong
+    print(f"    Castaways section: {len(cast_section)} chars")
+
+    # Split into table rows (each row starts with |-  or | )
+    # Each castaway is a block between |- markers
+    rows = re.split(r'\n\|-', cast_section)
+
+    eliminated = []
+    jury = []
+    final3 = []
+    winner = None
+    episode_count = 0
+    still_alive = []  # players with no finish yet
+
+    for row in rows:
+        # ── Extract name ──────────────────────────────────────────────────
+        # Pattern: '''[[Name]]''' or '''[[Name|Display]]'''
+        name_match = re.search(r"'''\[\[([^\]|]+)(?:\|[^\]]*)?\]\]'''", row)
+        if not name_match:
+            continue
+        raw_name = name_match.group(1).strip()
+        key = normalize(raw_name)
+        if not key:
+            print(f"    Skipping unrecognized name: '{raw_name}'")
+            continue
+
+        # ── Extract finish ────────────────────────────────────────────────
+        # Pattern: {{nowrap|FINISH TEXT}}
+        finish_match = re.search(r'\{\{nowrap\|([^}]+)\}\}', row)
+        if not finish_match:
+            # No finish yet = still in the game
+            still_alive.append(key)
+            print(f"    {key}: still in game (no finish)")
+            continue
+
+        finish_raw = finish_match.group(1)
+        # Clean up wiki markup inside finish
+        finish = re.sub(r'<br\s*/?>', '\n', finish_raw)
+        finish = re.sub(r'\{\{[^}]+\}\}', '', finish).strip()
+        finish_lower = finish.lower()
+
+        print(f"    {key}: '{finish.strip()}'")
+
+        # ── Classify the finish ───────────────────────────────────────────
+
+        is_out = bool(re.search(r'voted out|evacuated|eliminated|quit|medevac', finish_lower))
+        is_jury = bool(re.search(r'jury member', finish_lower))
+        is_runner_up = bool(re.search(r'runner.up|second runner', finish_lower))
+        is_winner = bool(re.search(r'sole survivor', finish_lower))
+
+        # Extract episode/day number for ordering
+        day_match = re.search(r'[Dd]ay\s+(\d+)', finish)
+        day = int(day_match.group(1)) if day_match else 999
+
+        if is_winner:
+            winner = key
+            final3.append(key)
+        elif is_runner_up:
+            final3.append(key)
+        elif is_out:
+            eliminated.append((key, day))
+            if is_jury:
+                jury.append((key, day))
+            # Track highest episode seen
+            ep_match = re.search(r'(\d+)(?:st|nd|rd|th)\s+[Vv]oted', finish)
+            if ep_match:
+                ep_num = int(ep_match.group(1))
+                if ep_num > episode_count:
+                    episode_count = ep_num
+
+    # Sort eliminations by day
+    eliminated.sort(key=lambda x: x[1])
+    jury.sort(key=lambda x: x[1])
+
+    eliminated_keys = [k for k, _ in eliminated]
+    jury_keys = [k for k, _ in jury]
+
+    milestones = {}
+
+    # Merge = first jury member's tribal + still alive players
+    if jury_keys:
+        # Everyone who made jury + final3 + winner + still_alive reached merge
+        merge_players = jury_keys + final3 + still_alive
+        if winner:
+            merge_players = list(set(merge_players + [winner]))
+        milestones["merge"] = list(set(merge_players))
+
+    if jury_keys:
+        milestones["jury"] = jury_keys
+
+    if final3:
+        milestones["final3"] = final3
+
+    if winner:
+        milestones["winner"] = winner
+
+    print(f"    Result: episode={episode_count}, eliminated={eliminated_keys}")
+    print(f"    Jury={jury_keys}, Final3={final3}, Winner={winner}")
+    print(f"    Still alive: {still_alive}")
 
     return {
         "episode": episode_count,
-        "eliminated": eliminated,
+        "eliminated": eliminated_keys,
         "milestones": milestones,
         "last_updated": datetime.now(timezone.utc).isoformat(),
-        "scrape_status": "ok_fandom_api"
+        "scrape_status": "ok_fandom_api_v4"
     }
 
+def scrape():
+    """Fetch and parse the Season 50 castaways table."""
+    print("  Using Fandom MediaWiki API (castaway table parser)...")
+
+    page_titles = [
+        "Survivor 50: In the Hands of the Fans",
+        "Survivor_50:_In_the_Hands_of_the_Fans",
+        "Survivor 50",
+    ]
+
+    for title in page_titles:
+        try:
+            wikitext = fandom_fetch(title)
+            print(f"    Got wikitext for '{title}' ({len(wikitext)} chars)")
+            result = parse_castaways_table(wikitext)
+            if result is not None:
+                return result
+        except Exception as e:
+            print(f"    '{title}' failed: {e}")
+
+    return None
+
 # ── MANUAL OVERRIDE ───────────────────────────────────────────────────────────
-# If scraping returns bad data, set USE_MANUAL_OVERRIDE = True,
-# fill in MANUAL_DATA below, commit to GitHub, then Render -> Trigger Run.
+# Set USE_MANUAL_OVERRIDE = True if automatic scraping produces wrong results.
+# Update MANUAL_DATA each week, commit to GitHub, then Render → Trigger Run.
 
 USE_MANUAL_OVERRIDE = False
 
 MANUAL_DATA = {
     "episode": 1,
     "eliminated": [],
-    # "eliminated": ["Jenna"],
+    # "eliminated": ["Jenna"],              # after ep 1
+    # "eliminated": ["Jenna", "Rizo"],      # after ep 2 (keep all previous!)
     "milestones": {
-        # "merge":  ["Aubrey","Cirie","Joe","Devens","Mike","Dee","Steph","Colby","Charlie","Kamilla","Tiffany","Angelina","Kyle"],
-        # "jury":   ["Jenna","Coach"],
+        # Add these as they happen:
+        # "merge":  ["Aubrey","Cirie","Joe","Devens","Mike","Dee","Colby","Charlie","Kamilla","Tiffany","Angelina","Kyle","Q"],
+        # "jury":   ["Jenna","Rizo"],
         # "final3": ["Aubrey","Cirie","Mike"],
         # "winner": "Aubrey"
     },
@@ -291,10 +283,10 @@ MANUAL_DATA = {
     "scrape_status": "manual"
 }
 
-# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"\n[{datetime.now(timezone.utc).isoformat()}] Survivor 50 scraper starting...")
+    print(f"\n[{datetime.now(timezone.utc).isoformat()}] Survivor 50 scraper v4 starting...")
     existing = load_existing()
     print(f"  Existing: episode={existing.get('episode',0)}, "
           f"eliminated={existing.get('eliminated',[])}")
@@ -306,7 +298,7 @@ def main():
 
     result = scrape()
 
-    if result and result["episode"] >= 0:
+    if result is not None:
         save(result)
         return result
 

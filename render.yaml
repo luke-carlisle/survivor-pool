@@ -1,0 +1,20 @@
+services:
+  # ── Web API (always running, serves /data endpoint) ──────────────────────
+  - type: web
+    name: survivor-pool-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python api.py
+    envVars:
+      - key: PORT
+        value: 8000
+
+  # ── Nightly scraper cron job ──────────────────────────────────────────────
+  # Runs every night at 2am UTC (10pm EST / 7pm PST)
+  # Survivor airs Wednesdays — wiki is usually updated within a few hours
+  - type: cron
+    name: survivor-scraper
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    schedule: "0 2 * * *"
+    startCommand: python scraper.py

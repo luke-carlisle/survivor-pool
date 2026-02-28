@@ -1,0 +1,3 @@
+# No third-party dependencies needed!
+# Uses only Python standard library (urllib, json, http.server)
+# This file is required by Render even if empty.

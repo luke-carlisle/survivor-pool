@@ -294,7 +294,7 @@ var API_DATA = null;
 // ════════════════════════════════════════════════
 // API FETCH — loads live episode data from Render
 // ════════════════════════════════════════════════
-var API_URL = 'https://survivor-pool-warp.onrender.com/'; // ← you will fill this in after deploying to Render
+var API_URL = 'https://survivor-pool-warp.onrender.com/data'; // ← you will fill this in after deploying to Render
 
 // Fallback data used while loading or if API is unreachable
 var EPISODES = [
@@ -556,8 +556,23 @@ function switchView(v){
 }
 function render(){ renderLB(); renderTeams(); if(curView==='table') renderTable(); }
 
-// Init — fetch live data first, fall back to pre-season if API unreachable
-fetchLiveData();
+// Init
+window.onload = function() {
+  try {
+    buildTabs();
+    render(); // render pre-season data immediately so page isn't blank
+    fetchLiveData(); // then fetch live data and re-render
+  } catch(e) {
+    // If anything fails, show an error so we can debug
+    var main = document.querySelector('main');
+    if (main) {
+      var err = document.createElement('div');
+      err.style.cssText = 'color:#F4770B;font-family:monospace;padding:20px;';
+      err.textContent = 'JS Error: ' + e.message + ' (line ' + e.lineNumber + ')';
+      main.insertBefore(err, main.firstChild);
+    }
+  }
+};
 
 </script>
 </body>

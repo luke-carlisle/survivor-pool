@@ -1,221 +1,210 @@
 """
-Fundas Friends Survivor 50 — Auto Scraper
-Reads the Survivor Fandom wiki and writes survivor_data.json
-Run automatically every night via Render cron job.
+Fundas Friends Survivor 50 — Auto Scraper v2
+Tries multiple sources in order:
+  1. Wikipedia API (most reliable, fully open)
+  2. Survivor Fandom wiki (with proper browser headers)
+Falls back to existing data if all sources fail.
 """
 
 import json
 import re
 import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
+import os
 
-# ── CONFIGURATION ────────────────────────────────────────────────────────────
+DATA_FILE = os.path.join(os.path.dirname(__file__), "survivor_data.json")
 
-SEASON = 50
-WIKI_URL = "https://survivor.fandom.com/wiki/Survivor_50"
-
-# These are the exact cast member keys used in your HTML page.
-# If the wiki spells a name differently, add a mapping here.
 NAME_MAP = {
-    "Aubry Bracco":              "Aubrey",
-    "Aubry":                     "Aubrey",
-    "Aubrey":                    "Aubrey",
-    "Genevieve Mushaluk":        "Genevieve",
-    "Genevieve":                 "Genevieve",
-    "Rizo Velovic":              "Rizo",
-    "Rizo":                      "Rizo",
-    "Rick Devens":               "Devens",
-    "Rick":                      "Devens",
-    "Devens":                    "Devens",
-    "Stephenie LaGrossa":        "Steph",
-    "Stephenie":                 "Steph",
-    "Steph":                     "Steph",
-    "Cirie Fields":              "Cirie",
-    "Cirie":                     "Cirie",
-    "Charlie Davis":             "Charlie",
-    "Charlie":                   "Charlie",
-    "Kamilla Karthigesu":        "Kamilla",
-    "Kamilla":                   "Kamilla",
-    "Tiffany Ervin":             "Tiffany",
-    "Tiffany":                   "Tiffany",
-    "Colby Donaldson":           "Colby",
-    "Colby":                     "Colby",
-    "Emily Flippen":             "Emily",
-    "Emily":                     "Emily",
-    "Joe Hunter":                "Joe",
-    "Joe":                       "Joe",
-    "Jenna Lewis-Dougherty":     "Jenna",
-    "Jenna Lewis":               "Jenna",
-    "Jenna":                     "Jenna",
-    "Benjamin Wade":             "Coach",
-    "Coach Wade":                "Coach",
-    "Coach":                     "Coach",
-    "Christian Hubicki":         "Christian",
-    "Christian":                 "Christian",
-    "Mike White":                "Mike",
-    "Mike":                      "Mike",
-    "Dee Valladares":            "Dee",
-    "Dee":                       "Dee",
-    "Savannah Louie":            "Savanah",
-    "Savanah":                   "Savanah",
-    "Jonathan Young":            "Josh",
-    "Jonathan":                  "Josh",
-    "Josh":                      "Josh",
-    "Chrissy Hofbeck":           "Chrissy",
-    "Chrissy":                   "Chrissy",
-    "Ozzy Lusth":                "Ozzy",
-    "Ozzy":                      "Ozzy",
-    "Kyle Fraser":               "Kyle",
-    "Kyle":                      "Kyle",
-    "Angelina Keeley":           "Angelina",
-    "Angelina":                  "Angelina",
-    "Q Burdette":                "Q",
-    "Q":                         "Q",
+    "Aubry Bracco":"Aubrey","Aubry":"Aubrey","Aubrey":"Aubrey",
+    "Genevieve Mushaluk":"Genevieve","Genevieve":"Genevieve",
+    "Rizo Velovic":"Rizo","Rizo":"Rizo",
+    "Rick Devens":"Devens","Rick":"Devens","Devens":"Devens",
+    "Stephenie LaGrossa":"Steph","Stephenie":"Steph","Steph":"Steph",
+    "Cirie Fields":"Cirie","Cirie":"Cirie",
+    "Charlie Davis":"Charlie","Charlie":"Charlie",
+    "Kamilla Karthigesu":"Kamilla","Kamilla":"Kamilla",
+    "Tiffany Ervin":"Tiffany","Tiffany":"Tiffany",
+    "Colby Donaldson":"Colby","Colby":"Colby",
+    "Emily Flippen":"Emily","Emily":"Emily",
+    "Joe Hunter":"Joe","Joe":"Joe",
+    "Jenna Lewis-Dougherty":"Jenna","Jenna Lewis":"Jenna","Jenna":"Jenna",
+    "Benjamin Wade":"Coach","Coach Wade":"Coach","Coach":"Coach",
+    "Christian Hubicki":"Christian","Christian":"Christian",
+    "Mike White":"Mike","Mike":"Mike",
+    "Dee Valladares":"Dee","Dee":"Dee",
+    "Savannah Louie":"Savanah","Savanah":"Savanah",
+    "Jonathan Young":"Josh","Jonathan":"Josh","Josh":"Josh",
+    "Chrissy Hofbeck":"Chrissy","Chrissy":"Chrissy",
+    "Ozzy Lusth":"Ozzy","Ozzy":"Ozzy",
+    "Kyle Fraser":"Kyle","Kyle":"Kyle",
+    "Angelina Keeley":"Angelina","Angelina":"Angelina",
+    "Q Burdette":"Q","Q":"Q",
 }
 
-ALL_CAST = [
-    "Aubrey","Genevieve","Rizo","Devens","Steph","Cirie","Charlie","Kamilla",
-    "Tiffany","Colby","Emily","Joe","Jenna","Coach","Christian","Mike","Dee",
-    "Savanah","Josh","Chrissy","Ozzy","Kyle","Angelina","Q"
-]
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",
+    "Connection": "keep-alive",
+}
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
+def fetch(url, extra_headers=None):
+    h = dict(HEADERS)
+    if extra_headers:
+        h.update(extra_headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
 
 def normalize(name):
-    """Map a wiki name to our internal cast key."""
     name = name.strip()
     if name in NAME_MAP:
         return NAME_MAP[name]
-    # Try first name only
     first = name.split()[0] if name else ""
-    if first in NAME_MAP:
-        return NAME_MAP[first]
-    return None
-
-
-def fetch_html(url):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; FundasFriendsSurvivorPool/1.0)"
-    })
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
-
+    return NAME_MAP.get(first)
 
 def strip_tags(html):
-    """Very simple tag stripper."""
     return re.sub(r"<[^>]+>", "", html)
 
-
-# ── SCRAPER ──────────────────────────────────────────────────────────────────
-
-def scrape():
-    """
-    Scrape the Survivor Fandom wiki and return structured episode data.
-    Falls back to the previous saved data if scraping fails.
-    """
-    print(f"[{datetime.now()}] Scraping {WIKI_URL} ...")
-
+def load_existing():
     try:
-        html = fetch_html(WIKI_URL)
-    except Exception as e:
-        print(f"  ERROR fetching wiki: {e}")
-        return None
+        with open(DATA_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"episode":0,"eliminated":[],"milestones":{},"scrape_status":"no_data"}
 
-    # ── Find episode count ────────────────────────────────────────────────
-    # Look for patterns like "Episode 1", "Episode 2" etc in the HTML
-    episode_numbers = re.findall(r'[Ee]pisode\s+(\d+)', html)
-    max_episode = max([int(n) for n in episode_numbers], default=0)
-    max_episode = min(max_episode, 26)  # cap at 26 (typical season length)
-    print(f"  Detected up to episode {max_episode}")
+def save(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  Saved: episode={data['episode']}, eliminated={data['eliminated']}, status={data['scrape_status']}")
 
-    # ── Find eliminated players ───────────────────────────────────────────
-    # The wiki elimination table uses patterns like "Voted Out", "Eliminated"
-    # We look for cast names near those phrases
-    eliminated = []
-
-    # Strategy 1: Look for "Voted Out" sections with names
-    voted_out_blocks = re.findall(
-        r'(?:Voted\s+[Oo]ut|Eliminated|Sole\s+Survivor)[^<]{0,200}',
-        html
-    )
-
-    # Strategy 2: Look for the episode summary table rows
-    # Wiki tables typically have: Episode | Tribal | Voted Out
-    table_rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
-
-    found_names = set()
-    for row in table_rows:
-        text = strip_tags(row)
-        for cast_name, key in NAME_MAP.items():
-            if cast_name.lower() in text.lower() and (
-                "voted out" in text.lower() or
-                "eliminated" in text.lower() or
-                "quit" in text.lower() or
-                "medevac" in text.lower()
-            ):
-                found_names.add(key)
-
-    # Strategy 3: Check individual cast member pages for elimination info
-    # Look for "Finish" or "Days lasted" patterns
-    finish_pattern = re.findall(
-        r'(?:finish|placement|days)["\s:>]+([^<"]{3,40})',
-        html, re.IGNORECASE
-    )
-
-    eliminated = list(found_names)
-    print(f"  Found {len(eliminated)} eliminated players: {eliminated}")
-
-    # ── Find milestones ───────────────────────────────────────────────────
+def parse_wikitext(text, source=""):
+    eliminated = set()
     milestones = {}
+    episode_count = 0
 
-    # Merge detection
-    merge_names = []
-    merge_blocks = re.findall(
-        r'(?:merge|merged)[^<]{0,500}',
-        html, re.IGNORECASE
-    )
-    for block in merge_blocks:
-        for cast_name, key in NAME_MAP.items():
-            if cast_name.lower() in block.lower():
-                merge_names.append(key)
-    if merge_names:
-        milestones["merge"] = list(set(merge_names))
+    ep_nums = re.findall(r'[Ee]pisode[s]?\s*(\d+)', text)
+    if ep_nums:
+        episode_count = max((int(n) for n in ep_nums if int(n) <= 30), default=0)
 
-    # Jury detection
-    jury_names = []
-    jury_blocks = re.findall(
-        r'(?:jury member|joined the jury)[^<]{0,300}',
-        html, re.IGNORECASE
-    )
-    for block in jury_blocks:
-        for cast_name, key in NAME_MAP.items():
-            if cast_name.lower() in block.lower():
-                jury_names.append(key)
-    if jury_names:
-        milestones["jury"] = list(set(jury_names))
+    rows = re.split(r'\|-', text)
+    for row in rows:
+        is_elim = bool(re.search(r'[Vv]oted\s+[Oo]ut|[Ee]liminated|[Qq]uit|[Mm]edevac|[Ff]ire[- ][Mm]aking', row))
+        if not is_elim:
+            continue
+        names_found = re.findall(r'\[\[([^\]|]+)', row)
+        names_found += re.findall(r'\|\s*([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s*\|', row)
+        for name in names_found:
+            key = normalize(name.strip())
+            if key:
+                eliminated.add(key)
 
-    # Winner detection
-    winner_match = re.search(
-        r'(?:Sole Survivor|winner)["\s:>]+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)',
-        html
-    )
+    merge_section = re.search(r'[Mm]erge[^.]{0,500}', text)
+    if merge_section:
+        merge_keys = [normalize(n) for n in re.findall(r'\[\[([^\]|]+)', merge_section.group(0)) if normalize(n)]
+        if merge_keys:
+            milestones["merge"] = list(set(merge_keys))
+
+    jury_section = re.search(r'[Jj]ury[^.]{0,500}', text)
+    if jury_section:
+        jury_keys = [normalize(n) for n in re.findall(r'\[\[([^\]|]+)', jury_section.group(0)) if normalize(n)]
+        if jury_keys:
+            milestones["jury"] = list(set(jury_keys))
+
+    winner_match = re.search(r'[Ss]ole\s+[Ss]urvivor[^\n]{0,100}\[\[([^\]|]+)', text)
     if winner_match:
-        winner_key = normalize(winner_match.group(1))
-        if winner_key:
-            milestones["winner"] = winner_key
+        wk = normalize(winner_match.group(1))
+        if wk:
+            milestones["winner"] = wk
 
-    return {
-        "episode": max_episode,
-        "eliminated": eliminated,
+    result = {
+        "episode": episode_count,
+        "eliminated": list(eliminated),
         "milestones": milestones,
         "last_updated": datetime.now(timezone.utc).isoformat(),
-        "scrape_status": "ok"
+        "scrape_status": "ok_wikipedia"
     }
+    print(f"    Parsed: {result}")
+    return result
 
+def scrape_wikipedia():
+    print("  Trying Wikipedia API...")
+    titles = [
+        "Survivor 50",
+        "Survivor: In the Hands of the Fans",
+        "Survivor (season 50)",
+    ]
+    # Also try a search first
+    try:
+        search_url = (
+            "https://en.wikipedia.org/w/api.php?action=query&list=search"
+            "&srsearch=Survivor+season+50+CBS+2026&format=json&srlimit=3"
+        )
+        raw = fetch(search_url, {"Accept":"application/json"})
+        found = [r["title"] for r in json.loads(raw).get("query",{}).get("search",[])]
+        print(f"    Search found: {found}")
+        titles = found + titles
+    except Exception as e:
+        print(f"    Search failed: {e}")
+
+    for title in titles:
+        try:
+            encoded = urllib.parse.quote(title)
+            url = (f"https://en.wikipedia.org/w/api.php?action=parse&page={encoded}"
+                   f"&prop=wikitext&format=json")
+            raw = fetch(url, {"Accept":"application/json"})
+            data = json.loads(raw)
+            if "error" in data:
+                print(f"    '{title}': {data['error'].get('info','error')}")
+                continue
+            wikitext = data.get("parse",{}).get("wikitext",{}).get("*","")
+            if wikitext:
+                print(f"    Got wikitext for '{title}' ({len(wikitext)} chars)")
+                return parse_wikitext(wikitext, title)
+        except Exception as e:
+            print(f"    '{title}' failed: {e}")
+    return None
+
+def scrape_fandom():
+    print("  Trying Fandom wiki with browser headers...")
+    urls = [
+        "https://survivor.fandom.com/wiki/Survivor_50",
+        "https://survivor.fandom.com/wiki/Survivor:_In_the_Hands_of_the_Fans",
+    ]
+    for url in urls:
+        try:
+            html = fetch(url)
+            print(f"    Got {len(html)} bytes")
+            # Parse HTML elimination tables
+            eliminated = set()
+            text = strip_tags(html)
+            ep_nums = re.findall(r'[Ee]pisode\s+(\d+)', text)
+            episode_count = max((int(n) for n in ep_nums if int(n) <= 30), default=0)
+            for line in text.split('\n'):
+                if re.search(r'[Vv]oted\s+[Oo]ut|[Ee]liminated|[Qq]uit|[Mm]edevac', line):
+                    for name, key in NAME_MAP.items():
+                        if name.lower() in line.lower():
+                            eliminated.add(key)
+            return {
+                "episode": episode_count,
+                "eliminated": list(eliminated),
+                "milestones": {},
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "scrape_status": "ok_fandom"
+            }
+        except Exception as e:
+            print(f"    {url} failed: {e}")
+    return None
 
 # ── MANUAL OVERRIDE ───────────────────────────────────────────────────────────
-# If the scraper gets confused, edit this function directly.
-# Set USE_MANUAL_OVERRIDE = True, fill in the data, and redeploy.
+# Set USE_MANUAL_OVERRIDE = True and fill in MANUAL_DATA if scraping fails.
+# Then go to Render -> Cron Job -> "Trigger Run"
 
 USE_MANUAL_OVERRIDE = False
 
@@ -225,7 +214,7 @@ MANUAL_DATA = {
     # Examples:
     # "eliminated": ["Jenna", "Coach"],
     "milestones": {
-        # "merge":  ["Aubrey","Cirie","Joe","Devens","Mike","Dee","Steph","Colby","Emily","Joe","Charlie","Kamilla","Tiffany"],
+        # "merge":  ["Aubrey","Cirie","Joe","Devens","Mike","Dee","Steph","Colby","Emily","Charlie","Kamilla","Tiffany","Angelina"],
         # "jury":   ["Coach","Jenna"],
         # "final3": ["Aubrey","Cirie","Mike"],
         # "winner": "Aubrey"
@@ -234,42 +223,37 @@ MANUAL_DATA = {
     "scrape_status": "manual"
 }
 
-
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Load existing data as fallback
-    existing = {
-        "episode": 0,
-        "eliminated": [],
-        "milestones": {},
-        "last_updated": None,
-        "scrape_status": "no_data"
-    }
-    try:
-        with open("survivor_data.json") as f:
-            existing = json.load(f)
-        print(f"  Loaded existing data (episode {existing.get('episode',0)})")
-    except FileNotFoundError:
-        print("  No existing data file, starting fresh")
+    print(f"\n[{datetime.now(timezone.utc).isoformat()}] Survivor 50 scraper starting...")
+    existing = load_existing()
+    print(f"  Existing: episode={existing.get('episode',0)}, eliminated={existing.get('eliminated',[])}")
 
     if USE_MANUAL_OVERRIDE:
-        print("  Using manual override data")
-        data = MANUAL_DATA
-    else:
-        data = scrape()
-        if data is None:
-            print("  Scrape failed, keeping existing data")
-            data = existing
-            data["scrape_status"] = "failed_kept_existing"
+        print("  Using manual override")
+        save(MANUAL_DATA)
+        return MANUAL_DATA
 
-    with open("survivor_data.json", "w") as f:
-        json.dump(data, f, indent=2)
+    result = scrape_wikipedia()
+    if result and (result["episode"] > 0 or result["eliminated"]):
+        print("  Wikipedia succeeded")
+        save(result)
+        return result
+    print("  Wikipedia returned no useful data (article may not exist yet)")
 
-    print(f"  Saved survivor_data.json (episode {data['episode']}, "
-          f"{len(data['eliminated'])} eliminated, status: {data['scrape_status']})")
-    return data
+    result = scrape_fandom()
+    if result and (result["episode"] > 0 or result["eliminated"]):
+        print("  Fandom succeeded")
+        save(result)
+        return result
+    print("  Fandom returned no useful data")
 
+    print("  All sources failed. Keeping existing data.")
+    existing["scrape_status"] = "all_failed_kept_existing"
+    existing["last_updated"] = datetime.now(timezone.utc).isoformat()
+    save(existing)
+    return existing
 
 if __name__ == "__main__":
     main()
